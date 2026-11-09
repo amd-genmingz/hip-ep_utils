@@ -1,0 +1,1456 @@
+From 91fa0eef319eaaff275043a2a8a77e9c45889143 Mon Sep 17 00:00:00 2001
+From: genmingz <genmingz@amd.com>
+Date: Tue, 3 Nov 2026 02:49:27 -0600
+Subject: [PATCH] add dump
+
+---
+ docs/design/tensor-dump.md                    | 123 ++++++++
+ docs/pipeline_pass_menu.md                    |   6 +
+ include/hip/Dialect/IR/HipOps.td              |  38 +++
+ include/hip/Dialect/Transforms/Passes.td      |  36 +++
+ lib/Compiler/CompilerDriver.cpp               |  28 ++
+ lib/Conversion/HipToLLVM/CMakeLists.txt       |   1 +
+ .../HipToLLVM/DumpTensorLowering.cpp          | 123 ++++++++
+ lib/Conversion/HipToLLVM/HipToLLVM.cpp        |   1 +
+ lib/Conversion/HipToLLVM/HipToLLVMUtils.h     |   7 +
+ lib/Dialect/Transforms/CMakeLists.txt         |   1 +
+ lib/Dialect/Transforms/TensorDump.cpp         | 230 ++++++++++++++
+ lib/Runtime/CMakeLists.txt                    |   4 +
+ lib/Runtime/hipdnn_ep_runtime.h               |  17 ++
+ lib/Runtime/hipdnn_ep_runtime_state.cpp       |   1 +
+ lib/Runtime/hipdnn_ep_runtime_tensor.cpp      |   1 +
+ lib/Runtime/mock/memory.cpp                   |   9 +
+ lib/Runtime/real/memory.cpp                   |  23 ++
+ lib/Runtime/runtime_state_internal.h          |   6 +
+ lib/Runtime/tensor_dump.cpp                   | 286 ++++++++++++++++++
+ test/runtime/CMakeLists.txt                   |  16 +
+ test/runtime/test_tensor_dump.cpp             | 192 ++++++++++++
+ 21 files changed, 1149 insertions(+)
+ create mode 100644 docs/design/tensor-dump.md
+ create mode 100644 lib/Conversion/HipToLLVM/DumpTensorLowering.cpp
+ create mode 100644 lib/Dialect/Transforms/TensorDump.cpp
+ create mode 100644 lib/Runtime/tensor_dump.cpp
+ create mode 100644 test/runtime/test_tensor_dump.cpp
+
+diff --git a/docs/design/tensor-dump.md b/docs/design/tensor-dump.md
+new file mode 100644
+index 000000000..9a4d4a468
+--- /dev/null
++++ b/docs/design/tensor-dump.md
+@@ -0,0 +1,123 @@
++<!--
++Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
++Licensed under the MIT License.
++-->
++# Tensor dump
++
++Debug instrumentation for accuracy triage: write the value of every ONNX tensor
++the HIP graph computes during the first inference, named so that each file
++pairs with ONNX Runtime's CPU node dump of the same model.
++
++## Usage
++
++| Variable | Read at | Meaning |
++|---|---|---|
++| `HIPDNN_EP_DUMP_DIR` | compile and run time | Dump directory. Unset, empty, or `0` disables the feature. |
++| `HIPDNN_EP_DUMP_START` | run time | First dump index written (inclusive, default 0). |
++| `HIPDNN_EP_DUMP_END` | run time | Last dump index written (inclusive, default unbounded). |
++
++At compile time a set `HIPDNN_EP_DUMP_DIR` creates the directory if needed and
++adds the instrumentation passes. If the directory cannot be created, the
++compiler prints a warning and compiles without dumps.
++
++At run time the dump ops write only when `HIPDNN_EP_DUMP_DIR` is set. An
++artifact compiled with dumps therefore stays silent after the variable is
++unset. Conversely, a cached artifact compiled without dumps never writes;
++invalidate the model cache when turning the feature on.
++
++The CPU reference comes from ONNX Runtime's own node dump
++(`ORT_DEBUG_NODE_IO_DUMP_OUTPUT_DATA=1`,
++`ORT_DEBUG_NODE_IO_DUMP_DATA_DESTINATION=files`). Both sides use the same file
++stem for a tensor, so a script can pair the two directories by stem.
++
++Every dump synchronizes the stream and copies to the host. Never benchmark with
++the feature enabled.
++
++## Output
++
++For each dumped tensor:
++
++- `<stem>.npy`: the logical tensor as an NPY v1.0 file (little-endian,
++  row-major, strided views packed), so dtype and shape travel with the data
++  and a comparison can type a headerless CPU-side `.bin` from it. `bfloat16`
++  and `float8_e4m3fn` have no NumPy type and are stored as opaque `|V2` /
++  `|V1` elements carrying the raw bits.
++- One line appended to `index.jsonl`:
++
++  ```json
++  {"index":12,"name":"/model/layers.0/Add_output_0","file":"_model_layers_0_Add_output_0.npy","dtype":"float16","shape":[1,8,2048]}
++  ```
++
++`<stem>` is the ONNX tensor name with every character that is not an ASCII
++letter or digit replaced by `_`, the ONNX Runtime node-dump rule. `index` is
++the static order in which the compiler inserted the dump, which is the value
++`HIPDNN_EP_DUMP_START`/`END` filter on. The index is rewritten by the first
++dump of each process and is complete up to the last dump written, even if the
++process crashes afterwards.
++
++Only the first inference of each session is written. Finished inferences are
++counted in `hipdnn_ep_stream_sync`, which `inference_compute` calls exactly
++once on exit. `hipdnn_ep_runtime_begin_compute` cannot serve as the counter:
++both the EP and `inference_compute` call it. Within that inference a tensor written
++repeatedly, for example inside an outlined loop body, keeps its last value.
++The first session to write a file owns it for the rest of the process, so a
++later compiled graph with the same tensor names (such as a decode
++specialization after prefill) does not overwrite it.
++
++## Compiler side
++
++`node.outputs`, the attribute the importer puts on each `onnx.*` op, is not
++copied onto the `hip.*` ops that conversion creates, but the Location is.
++Two passes, both added by `CompilerDriver` only when the feature is on, carry
++the names across:
++
++1. `hip-tag-onnx-output-locs` runs before `simplify-onnx`. It wraps each
++   tagged op's Location in a `FusedLoc` whose metadata is
++   `{hip.onnx_outputs = [...]}`.
++2. `hip-insert-tensor-dump` runs after the ONNX→HIP tail (after pool
++   planning, alloc lowering and extern-constant resolution) and before the
++   HIP→LLVM pipeline. For each HIP destination-style op directly in a
++   function body whose Location carries the names, it inserts one
++   `hip.dump_tensor` per memref init, right after the op.
++
++```mlir
++hip.add(%ctx) ins(%a, %b : ...) outs(%buf : memref<1x8x2048xf16>)
++hip.dump_tensor(%ctx) %buf {dtype = "float16", index = 12 : i64,
++    tensor_name = "/model/layers.0/Add_output_0"} : memref<1x8x2048xf16>
++```
++
++Inits map to ONNX outputs positionally when their counts agree. Otherwise the
++first named output is used, with an `_out<N>` suffix when the op has more than
++one init. When one ONNX node lowered to several HIP ops, only the last of them
++in program order is dumped, since it leaves the node's final value in the
++buffer.
++
++Inserting after memory planning keeps the instrumented program's buffer layout
++identical to production and adds no allocation. The dump reads its buffer
++before any later op can reuse that pool slot.
++
++`hip.dump_tensor` lowers to `hipdnn_ep_dump_tensor(state, data, shape, strides,
++rank, elem_bytes, dtype, name, index)`. The data pointer includes the
++descriptor offset. The runtime copies the smallest span that covers the view
++and packs it on the host.
++
++## Limitations
++
++- Ops nested in the region of another op (for example `hip.if` branches) are
++  not instrumented; outlined loop bodies are, because they are functions.
++- An ONNX tensor whose final value is assembled by several HIP ops writing
++  slices of one buffer is dumped as the slice the last op writes.
++- Tensors produced entirely by non-HIP code (folded constants, pure views such
++  as `Reshape`) have no dump; the comparison simply has no file for them.
++- Element types without a NumPy-style name (`index`, complex) are skipped.
++
++## Code
++
++| Piece | Location |
++|---|---|
++| Op | `include/hip/Dialect/IR/HipOps.td` (`hip.dump_tensor`) |
++| Passes | `lib/Dialect/Transforms/TensorDump.cpp` |
++| Pipeline wiring | `lib/Compiler/CompilerDriver.cpp` |
++| Lowering | `lib/Conversion/HipToLLVM/DumpTensorLowering.cpp` |
++| Runtime | `lib/Runtime/tensor_dump.cpp`, `hipdnn_ep_dump_copy_to_host` in `lib/Runtime/{real,mock}/memory.cpp` |
++| Unit test | `test/runtime/test_tensor_dump.cpp` (GPU-free) |
+diff --git a/docs/pipeline_pass_menu.md b/docs/pipeline_pass_menu.md
+index c6acdbf25..0049f4889 100644
+--- a/docs/pipeline_pass_menu.md
++++ b/docs/pipeline_pass_menu.md
+@@ -160,6 +160,8 @@ the selected perfConfig string are printed only with `--verbose`.
+ | `assign-op-state-slots` | module | Assign one op-state slot per stateful op instance (op-state-slots design). No-op without stateful ops. |
+ | `generate-op-state-init` | module | Emit `@hipdnn_ep_op_states_init_fn` from each stateful op's `generateOpStateInit`. No-op without stateful ops. |
+ | `convert-hip-to-llvm` | module | Lower HIP ops to runtime C-API calls / LLVM dialect. |
++| `hip-tag-onnx-output-locs` | module | Debug-only (`HIPDNN_EP_DUMP_DIR`): record each `onnx.*` op's `node.outputs` names in its Location. See [tensor dump](design/tensor-dump.md). |
++| `hip-insert-tensor-dump` | module | Debug-only (`HIPDNN_EP_DUMP_DIR`): insert `hip.dump_tensor` after each HIP op that produces a tagged ONNX tensor. See [tensor dump](design/tensor-dump.md). |
+ 
+ ### rocMLIR offload passes
+ 
+@@ -232,6 +234,8 @@ truth: `lib/Dialect/Transforms/Pipelines.cpp`.
+ 
+ ```
+ ONNX → HIP  (buildOnnxToHipPipeline)
++  [hip-tag-onnx-output-locs]         (HIPDNN_EP_DUMP_DIR only, added by the
++                                      compiler driver)
+   simplify-onnx
+   «slot: AfterSimplifyOnnx»
+   hip-add-context-arg
+@@ -279,6 +283,8 @@ ONNX → HIP  (buildOnnxToHipPipeline)
+   func.func(hip-lower-allocs)
+   hip-resolve-extern-constants
+   cse ; canonicalize
++  [hip-insert-tensor-dump]           (HIPDNN_EP_DUMP_DIR only, added by the
++                                      compiler driver)
+ 
+ HIP → LLVM  (buildHipToLLVMPipeline)
+   func.func(hip-relax-multi-dyn-expand-shape)
+diff --git a/include/hip/Dialect/IR/HipOps.td b/include/hip/Dialect/IR/HipOps.td
+index cfdc74cd5..15fcdc124 100644
+--- a/include/hip/Dialect/IR/HipOps.td
++++ b/include/hip/Dialect/IR/HipOps.td
+@@ -5828,6 +5828,44 @@ def Hip_ReadbackScalarOp : Hip_Op<"readback_scalar",
+   }];
+ }
+ 
++// hip.dump_tensor : debug instrumentation that writes the current contents of
++// a buffer to the tensor-dump directory. Inserted by --hip-insert-tensor-dump
++// only when HIPDNN_EP_DUMP_DIR is set at compile time; never present in
++// production IR.
++//
++//   hip.dump_tensor(%ctx) %buf {tensor_name = "/model/x", dtype = "float16",
++//                               index = 3 : i64} : memref<1x8x2048xf16>
++//
++// No memory effects are declared, so the op is conservatively treated as
++// reading and writing everything: it stays in program order right after the
++// op that produced `input`.
++def Hip_DumpTensorOp : Hip_Op<"dump_tensor"> {
++  let summary = "Copy a buffer to the host and write it to the dump directory";
++  let description = [{
++    Synchronizes the stream, copies `input` (honoring its offset and strides)
++    to the host, and writes it as a NumPy (NPY v1.0) file to
++    `<HIPDNN_EP_DUMP_DIR>/<sanitized tensor_name>.npy`, where every character
++    that is not an ASCII letter or digit is replaced with `_` (the ONNX Runtime
++    node-dump naming). `dtype` is the NumPy-style element type name recorded in
++    the dump index; `index` is the static insertion order used by the
++    HIPDNN_EP_DUMP_START / HIPDNN_EP_DUMP_END runtime filter.
++
++    Lowered to a call to `hipdnn_ep_dump_tensor` by convert-hip-to-llvm.
++  }];
++
++  let arguments = (ins
++    Hip_ContextType:$ctx,
++    AnyMemRef:$input,
++    StrAttr:$tensor_name,
++    StrAttr:$dtype,
++    I64Attr:$index
++  );
++
++  let assemblyFormat = [{
++    `(` $ctx `)` $input attr-dict `:` type($input)
++  }];
++}
++
+ def Hip_QuantizeLinearOp : Hip_DpsOp_AutoReifyInfer<"quantize_linear"> {
+   let summary = "ONNX QuantizeLinear";
+   let description = [{
+diff --git a/include/hip/Dialect/Transforms/Passes.td b/include/hip/Dialect/Transforms/Passes.td
+index 1133c83a2..e5ee83043 100644
+--- a/include/hip/Dialect/Transforms/Passes.td
++++ b/include/hip/Dialect/Transforms/Passes.td
+@@ -810,6 +810,42 @@ def ResolveExternConstantsPass
+   ];
+ }
+ 
++def TagOnnxOutputLocsPass
++    : Pass<"hip-tag-onnx-output-locs", "mlir::ModuleOp"> {
++  let summary = "Record each onnx.* op's ONNX output tensor names in its "
++                "Location";
++  let description = [{
++    Wraps the Location of every `onnx.*` op carrying a `node.outputs` attribute
++    in a FusedLoc whose metadata holds those output names. Conversion patterns
++    forward the source op's Location, so the names survive ONNX-to-HIP
++    conversion and bufferization and reach --hip-insert-tensor-dump.
++
++    Added to the pipeline ahead of ONNX-to-HIP only when HIPDNN_EP_DUMP_DIR is
++    set; the default pipeline does not run it.
++  }];
++}
++
++def InsertTensorDumpPass
++    : Pass<"hip-insert-tensor-dump", "mlir::ModuleOp"> {
++  let summary = "Insert hip.dump_tensor after each HIP op that produces an "
++                "ONNX tensor";
++  let description = [{
++    For every HIP destination-style op directly in a function body whose
++    Location carries ONNX output names (see --hip-tag-onnx-output-locs),
++    inserts one hip.dump_tensor per memref init right after the op. When one
++    ONNX node lowered to several HIP ops, only the last of them (in program
++    order) is dumped, because it is the one that leaves the node's final
++    value in the buffer. Ops nested in other regions are not instrumented.
++
++    Runs after memory planning and before convert-hip-to-llvm, so the dump
++    reads the buffers exactly as the production pipeline lays them out. Added
++    only when HIPDNN_EP_DUMP_DIR is set.
++  }];
++  let dependentDialects = [
++    "mlir::hip::HipDialect"
++  ];
++}
++
+ def ExternalizeConstantsPass
+     : Pass<"hip-externalize-constants", "mlir::ModuleOp"> {
+   let summary = "Apply storage policy to hip.constant carriers";
+diff --git a/lib/Compiler/CompilerDriver.cpp b/lib/Compiler/CompilerDriver.cpp
+index be0a5f428..d03be73ef 100644
+--- a/lib/Compiler/CompilerDriver.cpp
++++ b/lib/Compiler/CompilerDriver.cpp
+@@ -294,10 +294,30 @@ bool CompilerDriver::compileImpl(mlir::ModuleOp module,
+   return true;
+ }
+ 
++// HIPDNN_EP_DUMP_DIR (docs/design/tensor-dump.md): unset, empty or "0" leaves
++// the pipeline untouched. Otherwise the directory is created if needed and
++// the tensor-dump passes are added; the runtime re-reads the variable, so an
++// artifact compiled with dumps writes nothing once the variable is unset.
++static bool tensorDumpRequested() {
++  std::string dir = hip_get_env("HIPDNN_EP_DUMP_DIR");
++  if (dir.empty() || dir == "0")
++    return false;
++  if (std::error_code ec = llvm::sys::fs::create_directories(dir)) {
++    llvm::errs() << "[CompilerDriver] WARNING: HIPDNN_EP_DUMP_DIR='" << dir
++                 << "' cannot be created (" << ec.message()
++                 << "); tensor dump disabled.\n";
++    return false;
++  }
++  COMPILER_DEBUG_LOG("[CompilerDriver] HIPDNN_EP_DUMP_DIR set: inserting "
++                     "tensor dumps\n");
++  return true;
++}
++
+ bool CompilerDriver::runMLIRPasses(
+     mlir::ModuleOp module, const mlir::hip::CompilationOptionsT &options,
+     std::string &error_message) {
+   mlir::PassManager pm(module.getContext());
++  const bool dumpTensors = tensorDumpRequested();
+ 
+   if (hipdnn_ep_timing_enabled())
+     pm.enableTiming();
+@@ -407,6 +427,8 @@ bool CompilerDriver::runMLIRPasses(
+ 
+     {
+       mlir::PassManager headPm(module.getContext());
++      if (dumpTensors)
++        headPm.addPass(mlir::hip::createTagOnnxOutputLocsPass());
+       // Same handle plumbing as the default arm below. rocMLIR only claims
+       // the subgraphs fuse-rocmlir anchors on; everything else still wants
+       // the hipDNN graph passes, and CompilerAPI needs the compiled graphs to
+@@ -484,6 +506,8 @@ bool CompilerDriver::runMLIRPasses(
+         mlir::hip::kDefaultExternalizeMinNumElements;
+     tailOpts.skipConstantData = options.skip_constant_data;
+     mlir::hip::buildOnnxToHipPipelineTail(pm, tailOpts, fileSystem_);
++    if (dumpTensors)
++      pm.addPass(mlir::hip::createInsertTensorDumpPass());
+ 
+     mlir::hip::HipToLLVMPipelineOptions rocMlirLlvmOpts;
+     rocMlirLlvmOpts.constantsFile = options.constants_file;
+@@ -497,6 +521,8 @@ bool CompilerDriver::runMLIRPasses(
+         mlir::hip::kDefaultExternalizeMinNumElements;
+     onnxToHipOpts.skipConstantData = options.skip_constant_data;
+ 
++    if (dumpTensors)
++      pm.addPass(mlir::hip::createTagOnnxOutputLocsPass());
+     if (hipdnnHandle_) {
+       compiledGraphs_ =
+           std::make_shared<llvm::StringMap<mlir::hip::OwnedGraph>>();
+@@ -506,6 +532,8 @@ bool CompilerDriver::runMLIRPasses(
+     } else {
+       mlir::hip::buildOnnxToHipPipeline(pm, onnxToHipOpts, fileSystem_);
+     }
++    if (dumpTensors)
++      pm.addPass(mlir::hip::createInsertTensorDumpPass());
+ 
+     mlir::hip::HipToLLVMPipelineOptions hipToLlvmOpts;
+     hipToLlvmOpts.constantsFile = options.constants_file;
+diff --git a/lib/Conversion/HipToLLVM/CMakeLists.txt b/lib/Conversion/HipToLLVM/CMakeLists.txt
+index 7e84286e8..b029569b2 100644
+--- a/lib/Conversion/HipToLLVM/CMakeLists.txt
++++ b/lib/Conversion/HipToLLVM/CMakeLists.txt
+@@ -67,6 +67,7 @@ add_library(HipToLLVM STATIC
+   NonMaxSuppressionLowering.cpp
+   ReadbackDimLowering.cpp
+   ReadbackScalarLowering.cpp
++  DumpTensorLowering.cpp
+   SizeLowering.cpp
+   LoopLowering.cpp
+   ScanLowering.cpp
+diff --git a/lib/Conversion/HipToLLVM/DumpTensorLowering.cpp b/lib/Conversion/HipToLLVM/DumpTensorLowering.cpp
+new file mode 100644
+index 000000000..a217211f3
+--- /dev/null
++++ b/lib/Conversion/HipToLLVM/DumpTensorLowering.cpp
+@@ -0,0 +1,123 @@
++/*
++ * Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
++ * Licensed under the MIT License.
++ */
++
++#include "HipToLLVMUtils.h"
++
++namespace mlir {
++namespace hip {
++namespace {
++
++// hip.dump_tensor(%ctx) %buf {tensor_name, dtype, index} : memref<...>
++//   -> %shape   = llvm.alloca rank x i64     // descriptor sizes
++//      %strides = llvm.alloca rank x i64     // descriptor strides (elements)
++//      llvm.call @hipdnn_ep_dump_tensor(state, data_ptr, %shape, %strides,
++//                                       rank, elem_bytes, dtype, name, index)
++//
++// The data pointer includes the descriptor offset and the strides are passed
++// through, so a subview or a pool-backed view is dumped as its logical tensor
++// rather than as the base of the parent buffer.
++struct DumpTensorOpLowering : public ConvertOpToLLVMPattern<DumpTensorOp> {
++  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
++
++  /// Pointer to a NUL-terminated module-level string. Globals are keyed by
++  /// `symName`, so callers that pass the same symbol share one global.
++  static Value globalCString(ModuleOp module,
++                             ConversionPatternRewriter &rewriter, Location loc,
++                             StringRef symName, StringRef value) {
++    if (module.lookupSymbol<LLVM::GlobalOp>(symName))
++      return LLVM::AddressOfOp::create(
++          rewriter, loc, LLVM::LLVMPointerType::get(rewriter.getContext()),
++          symName);
++    std::string terminated = value.str();
++    terminated.push_back('\0');
++    return LLVM::createGlobalString(loc, rewriter, symName, terminated,
++                                    LLVM::Linkage::Internal);
++  }
++
++  LogicalResult
++  matchAndRewrite(DumpTensorOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    Location loc = op.getLoc();
++    ModuleOp module = op->getParentOfType<ModuleOp>();
++    Type ptrType = getPtrType();
++    Type i64Type = rewriter.getI64Type();
++
++    auto memrefType = cast<MemRefType>(op.getInput().getType());
++    Type elemType = memrefType.getElementType();
++    if (!elemType.isIntOrFloat())
++      return rewriter.notifyMatchFailure(op, "unsupported dump element type");
++    const int64_t elemBytes = (elemType.getIntOrFloatBitWidth() + 7) / 8;
++    const int64_t rank = memrefType.getRank();
++
++    Value dataPtr = extractMemRefDataPtr(adaptor.getInput(), memrefType,
++                                         typeConverter, rewriter, loc);
++    if (!dataPtr)
++      return rewriter.notifyMatchFailure(op, "failed to compute data ptr");
++
++    auto i64Const = [&](int64_t v) -> Value {
++      return LLVM::ConstantOp::create(rewriter, loc, i64Type,
++                                      rewriter.getI64IntegerAttr(v));
++    };
++
++    // A rank-0 buffer still gets a one-slot array so both pointers are valid.
++    Value slots = i64Const(rank > 0 ? rank : 1);
++    Value shapeArray =
++        LLVM::AllocaOp::create(rewriter, loc, ptrType, i64Type, slots, 8);
++    Value strideArray =
++        LLVM::AllocaOp::create(rewriter, loc, ptrType, i64Type, slots, 8);
++    MemRefDescriptor desc(adaptor.getInput());
++    for (int64_t d : llvm::seq<int64_t>(rank)) {
++      Value idx = i64Const(d);
++      Value shapeSlot = LLVM::GEPOp::create(rewriter, loc, ptrType, i64Type,
++                                            shapeArray, ValueRange{idx});
++      LLVM::StoreOp::create(rewriter, loc, desc.size(rewriter, loc, d),
++                            shapeSlot);
++      Value strideSlot = LLVM::GEPOp::create(rewriter, loc, ptrType, i64Type,
++                                             strideArray, ValueRange{idx});
++      LLVM::StoreOp::create(rewriter, loc, desc.stride(rewriter, loc, d),
++                            strideSlot);
++    }
++
++    const int64_t index = op.getIndex();
++    Value namePtr = globalCString(module, rewriter, loc,
++                                  ("__hip_dump_name_" + Twine(index)).str(),
++                                  op.getTensorName());
++    Value dtypePtr = globalCString(module, rewriter, loc,
++                                   ("__hip_dump_dtype_" + op.getDtype()).str(),
++                                   op.getDtype());
++
++    // void hipdnn_ep_dump_tensor(RuntimeState*, const void* data,
++    //                            const int64_t* shape, const int64_t* strides,
++    //                            int64_t rank, int64_t elem_bytes,
++    //                            const char* dtype, const char* name,
++    //                            int64_t index)
++    Type voidTy = LLVM::LLVMVoidType::get(rewriter.getContext());
++    SmallVector<Type, 9> paramTypes = {ptrType, ptrType, ptrType,
++                                       ptrType, i64Type, i64Type,
++                                       ptrType, ptrType, i64Type};
++    FailureOr<LLVM::LLVMFuncOp> funcOp = LLVM::lookupOrCreateFn(
++        rewriter, module, kHipDumpTensor, paramTypes, voidTy);
++    if (failed(funcOp))
++      return failure();
++
++    LLVM::CallOp::create(rewriter, loc, *funcOp,
++                         ValueRange{adaptor.getCtx(), dataPtr, shapeArray,
++                                    strideArray, i64Const(rank),
++                                    i64Const(elemBytes), dtypePtr, namePtr,
++                                    i64Const(index)});
++    rewriter.eraseOp(op);
++    return success();
++  }
++};
++
++} // namespace
++
++void populateDumpTensorLoweringPatterns(const LLVMTypeConverter &converter,
++                                        RewritePatternSet &patterns) {
++  patterns.add<DumpTensorOpLowering>(converter);
++}
++
++} // namespace hip
++} // namespace mlir
+diff --git a/lib/Conversion/HipToLLVM/HipToLLVM.cpp b/lib/Conversion/HipToLLVM/HipToLLVM.cpp
+index bf8370fa8..38a8a9144 100644
+--- a/lib/Conversion/HipToLLVM/HipToLLVM.cpp
++++ b/lib/Conversion/HipToLLVM/HipToLLVM.cpp
+@@ -290,6 +290,7 @@ populateLoweringPatterns(LLVMTypeConverter &typeConverter,
+   populateNonMaxSuppressionLoweringPatterns(typeConverter, patterns);
+   populateReadbackDimLoweringPatterns(typeConverter, patterns, hostScalars);
+   populateReadbackScalarLoweringPatterns(typeConverter, patterns, hostScalars);
++  populateDumpTensorLoweringPatterns(typeConverter, patterns);
+   populateSizeLoweringPatterns(typeConverter, patterns);
+   populatePoolLoweringPatterns(typeConverter, patterns);
+   populateResizeLoweringPatterns(typeConverter, patterns);
+diff --git a/lib/Conversion/HipToLLVM/HipToLLVMUtils.h b/lib/Conversion/HipToLLVM/HipToLLVMUtils.h
+index a92eec58d..0769fce4e 100644
+--- a/lib/Conversion/HipToLLVM/HipToLLVMUtils.h
++++ b/lib/Conversion/HipToLLVM/HipToLLVMUtils.h
+@@ -210,6 +210,10 @@ inline constexpr const char *kHipReadbackI32 = "hipdnn_ep_readback_i32";
+ // such as the i64/f32/f16 operands of a data-dependent onnx.Range).
+ inline constexpr const char *kHipReadbackScalar = "hipdnn_ep_readback_scalar";
+ 
++// Synchronize the stream and write a buffer to the tensor-dump directory
++// (hip.dump_tensor, HIPDNN_EP_DUMP_DIR).
++inline constexpr const char *kHipDumpTensor = "hipdnn_ep_dump_tensor";
++
+ // LLVM memref descriptor struct field indices.
+ // Layout: { allocatedPtr, alignedPtr, offset, sizes[rank], strides[rank] }
+ inline constexpr int64_t kAllocPtrIdx = 0;
+@@ -604,6 +608,9 @@ void populateReadbackDimLoweringPatterns(
+ void populateReadbackScalarLoweringPatterns(
+     const LLVMTypeConverter &converter, RewritePatternSet &patterns,
+     const DenseMap<Operation *, Value> &hostScalars);
++// hip.dump_tensor: debug-only buffer dump (HIPDNN_EP_DUMP_DIR).
++void populateDumpTensorLoweringPatterns(const LLVMTypeConverter &converter,
++                                        RewritePatternSet &patterns);
+ void populateSizeLoweringPatterns(const LLVMTypeConverter &converter,
+                                   RewritePatternSet &patterns);
+ void populateLoopLoweringPatterns(const LLVMTypeConverter &converter,
+diff --git a/lib/Dialect/Transforms/CMakeLists.txt b/lib/Dialect/Transforms/CMakeLists.txt
+index e5610c210..44257fb46 100644
+--- a/lib/Dialect/Transforms/CMakeLists.txt
++++ b/lib/Dialect/Transforms/CMakeLists.txt
+@@ -54,6 +54,7 @@ add_library(HipDialectTransforms STATIC
+   ResolveMemRefDims.cpp
+   ResolveTensorDims.cpp
+   SplitDuplicateDpsInits.cpp
++  TensorDump.cpp
+   UseOutputAllocator.cpp
+ )
+ 
+diff --git a/lib/Dialect/Transforms/TensorDump.cpp b/lib/Dialect/Transforms/TensorDump.cpp
+new file mode 100644
+index 000000000..ed4712858
+--- /dev/null
++++ b/lib/Dialect/Transforms/TensorDump.cpp
+@@ -0,0 +1,230 @@
++/*
++ * Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
++ * Licensed under the MIT License.
++ */
++
++//===- TensorDump.cpp - Tensor-dump instrumentation passes ----------------===//
++//
++// Two passes that implement HIPDNN_EP_DUMP_DIR (docs/design/tensor-dump.md):
++//
++//   --hip-tag-onnx-output-locs  (before ONNX-to-HIP)
++//     onnx.* ops carry their ONNX output tensor names in the `node.outputs`
++//     attribute, which conversion does not copy onto the hip.* ops it creates.
++//     Conversion does forward the Location, so the names are moved there:
++//
++//       loc(unknown)
++//     ->
++//       loc(fused<{hip.onnx_outputs = ["/m/Add_out"]}>[unknown])
++//
++//   --hip-insert-tensor-dump  (after memory planning, before HIP-to-LLVM)
++//       hip.add(%ctx) ins(...) outs(%buf)  loc(fused<{hip.onnx_outputs = ...}>)
++//     ->
++//       hip.add(%ctx) ins(...) outs(%buf)
++//       hip.dump_tensor(%ctx) %buf {tensor_name = "/m/Add_out", ...}
++//
++//===----------------------------------------------------------------------===//
++
++#include "hip/Dialect/IR/HipDialect.h"
++#include "hip/Dialect/Transforms/Passes.h"
++
++#include "mlir/Dialect/Func/IR/FuncOps.h"
++#include "mlir/IR/Builders.h"
++#include "mlir/IR/BuiltinAttributes.h"
++#include "mlir/IR/BuiltinOps.h"
++#include "mlir/IR/Location.h"
++#include "mlir/Interfaces/DestinationStyleOpInterface.h"
++#include "mlir/Pass/Pass.h"
++
++#include "llvm/ADT/DenseMap.h"
++#include "llvm/ADT/Statistic.h"
++
++#include <optional>
++#include <string>
++
++#define DEBUG_TYPE "hip-insert-tensor-dump"
++
++STATISTIC(NumTaggedOps, "Number of onnx ops tagged with output names");
++STATISTIC(NumDumpsInserted, "Number of hip.dump_tensor ops inserted");
++
++namespace mlir {
++namespace hip {
++
++#define GEN_PASS_DEF_TAGONNXOUTPUTLOCSPASS
++#define GEN_PASS_DEF_INSERTTENSORDUMPPASS
++#include "hip/Dialect/Transforms/Passes.h.inc"
++
++namespace {
++
++constexpr llvm::StringLiteral kOnnxOutputsKey = "hip.onnx_outputs";
++
++/// The output-name array recorded by --hip-tag-onnx-output-locs, searched
++/// through the Location tree because later rewrites may nest the tagged
++/// location inside other fused / name / call-site locations.
++ArrayAttr findOnnxOutputNames(Location loc) {
++  if (auto fused = dyn_cast<FusedLoc>(loc)) {
++    if (auto dict = dyn_cast_or_null<DictionaryAttr>(fused.getMetadata()))
++      if (auto names = dict.getAs<ArrayAttr>(kOnnxOutputsKey))
++        return names;
++    for (Location inner : fused.getLocations())
++      if (ArrayAttr names = findOnnxOutputNames(inner))
++        return names;
++    return {};
++  }
++  if (auto name = dyn_cast<NameLoc>(loc))
++    return findOnnxOutputNames(name.getChildLoc());
++  if (auto callSite = dyn_cast<CallSiteLoc>(loc)) {
++    if (ArrayAttr names = findOnnxOutputNames(callSite.getCallee()))
++      return names;
++    return findOnnxOutputNames(callSite.getCaller());
++  }
++  return {};
++}
++
++/// NumPy-style name of a dumpable element type; std::nullopt for types the
++/// dump index cannot describe (index, complex, ...), which are not dumped.
++std::optional<llvm::StringRef> dumpDtypeName(Type type) {
++  if (type.isF16())
++    return llvm::StringRef("float16");
++  if (type.isF32())
++    return llvm::StringRef("float32");
++  if (type.isBF16())
++    return llvm::StringRef("bfloat16");
++  if (type.isF64())
++    return llvm::StringRef("float64");
++  if (isa<Float8E4M3FNType>(type))
++    return llvm::StringRef("float8_e4m3fn");
++  auto intTy = dyn_cast<IntegerType>(type);
++  if (!intTy)
++    return std::nullopt;
++  const bool isUnsigned = intTy.isUnsigned();
++  switch (intTy.getWidth()) {
++  case 1:
++    return llvm::StringRef("bool");
++  case 8:
++    return llvm::StringRef(isUnsigned ? "uint8" : "int8");
++  case 16:
++    return llvm::StringRef(isUnsigned ? "uint16" : "int16");
++  case 32:
++    return llvm::StringRef(isUnsigned ? "uint32" : "int32");
++  case 64:
++    return llvm::StringRef(isUnsigned ? "uint64" : "int64");
++  default:
++    return std::nullopt;
++  }
++}
++
++/// Tensor name for init `idx` of an op with `numInits` inits. Inits map to
++/// ONNX outputs positionally when the counts agree; otherwise the first named
++/// output gets an `_out<idx>` suffix (paired with the unsuffixed name by
++/// accuracy_dirs.py). Empty when the ONNX output at `idx` is unnamed.
++std::string dumpTensorName(ArrayAttr names, size_t idx, size_t numInits) {
++  if (names.size() == numInits) {
++    auto name = dyn_cast<StringAttr>(names[idx]);
++    return name ? name.getValue().str() : std::string();
++  }
++  std::string base;
++  for (Attribute attr : names) {
++    auto name = dyn_cast<StringAttr>(attr);
++    if (name && !name.getValue().empty()) {
++      base = name.getValue().str();
++      break;
++    }
++  }
++  if (base.empty() || numInits == 1)
++    return base;
++  return base + "_out" + std::to_string(idx);
++}
++
++struct TagOnnxOutputLocsPass
++    : public impl::TagOnnxOutputLocsPassBase<TagOnnxOutputLocsPass> {
++  void runOnOperation() override {
++    MLIRContext *ctx = &getContext();
++    getOperation().walk([&](Operation *op) {
++      if (!op->getName().getStringRef().starts_with("onnx."))
++        return;
++      auto outputs = op->getAttrOfType<ArrayAttr>("node.outputs");
++      if (!outputs)
++        return;
++      bool anyNamed = llvm::any_of(outputs, [](Attribute attr) {
++        auto name = dyn_cast<StringAttr>(attr);
++        return name && !name.getValue().empty();
++      });
++      if (!anyNamed)
++        return;
++      auto metadata = DictionaryAttr::get(
++          ctx,
++          {NamedAttribute(StringAttr::get(ctx, kOnnxOutputsKey), outputs)});
++      op->setLoc(FusedLoc::get(ctx, {op->getLoc()}, metadata));
++      ++NumTaggedOps;
++    });
++  }
++};
++
++struct InsertTensorDumpPass
++    : public impl::InsertTensorDumpPassBase<InsertTensorDumpPass> {
++  void runOnOperation() override {
++    int64_t nextIndex = 0;
++    getOperation().walk(
++        [&](func::FuncOp func) { instrumentFunction(func, nextIndex); });
++  }
++
++private:
++  struct Candidate {
++    Operation *op;
++    Value ctx;
++    ArrayAttr names;
++    SmallVector<Value> inits;
++  };
++
++  static void instrumentFunction(func::FuncOp func, int64_t &nextIndex) {
++    auto *hipDialect = func->getContext()->getLoadedDialect<HipDialect>();
++    SmallVector<Candidate> candidates;
++    llvm::DenseMap<Attribute, size_t> lastForNames;
++    for (Block &block : func.getBody()) {
++      for (Operation &op : block) {
++        if (op.getDialect() != hipDialect || isa<DumpTensorOp>(op))
++          continue;
++        auto dps = dyn_cast<DestinationStyleOpInterface>(&op);
++        if (!dps || op.getNumOperands() == 0 ||
++            !isa<ContextType>(op.getOperand(0).getType()))
++          continue;
++        ArrayAttr names = findOnnxOutputNames(op.getLoc());
++        if (!names)
++          continue;
++        Candidate candidate{&op, op.getOperand(0), names, {}};
++        for (OpOperand &init : dps.getDpsInitsMutable())
++          if (isa<MemRefType>(init.get().getType()))
++            candidate.inits.push_back(init.get());
++        if (candidate.inits.empty())
++          continue;
++        lastForNames[names] = candidates.size();
++        candidates.push_back(std::move(candidate));
++      }
++    }
++
++    for (auto [pos, candidate] : llvm::enumerate(candidates)) {
++      if (lastForNames.lookup(candidate.names) != pos)
++        continue;
++      OpBuilder builder(candidate.op->getContext());
++      builder.setInsertionPointAfter(candidate.op);
++      const size_t numInits = candidate.inits.size();
++      for (auto [idx, init] : llvm::enumerate(candidate.inits)) {
++        std::string name = dumpTensorName(candidate.names, idx, numInits);
++        auto memrefTy = cast<MemRefType>(init.getType());
++        std::optional<llvm::StringRef> dtype =
++            dumpDtypeName(memrefTy.getElementType());
++        if (name.empty() || !dtype)
++          continue;
++        DumpTensorOp::create(builder, candidate.op->getLoc(), candidate.ctx,
++                             init, builder.getStringAttr(name),
++                             builder.getStringAttr(*dtype),
++                             builder.getI64IntegerAttr(nextIndex++));
++        ++NumDumpsInserted;
++      }
++    }
++  }
++};
++
++} // namespace
++} // namespace hip
++} // namespace mlir
+diff --git a/lib/Runtime/CMakeLists.txt b/lib/Runtime/CMakeLists.txt
+index 78b71444e..ee1b2500f 100644
+--- a/lib/Runtime/CMakeLists.txt
++++ b/lib/Runtime/CMakeLists.txt
+@@ -292,6 +292,8 @@ compile_to_bitcode(hipdnn_ep_runtime_if.cpp runtime_if.bc)
+ compile_to_bitcode(op_profile.cpp runtime_op_profile.bc)
+ compile_to_bitcode(chrome_trace.cpp runtime_chrome_trace.bc)
+ compile_to_bitcode(output_allocator.cpp runtime_output_allocator.bc)
++# hip.dump_tensor host side; the backend copy lives in real/ or mock/memory.cpp.
++compile_to_bitcode(tensor_dump.cpp runtime_tensor_dump.bc)
+ # Op-state slots ABI + reference constructors. Shared (host-only allocation),
+ # so the same TU serves both the real and mock runtimes.
+ compile_to_bitcode(op_state.cpp runtime_op_state.bc)
+@@ -413,6 +415,7 @@ if(NOT BUILD_MOCK_RUNTIME)
+         ${CMAKE_CURRENT_BINARY_DIR}/runtime_op_profile.bc
+         ${CMAKE_CURRENT_BINARY_DIR}/runtime_chrome_trace.bc
+         ${CMAKE_CURRENT_BINARY_DIR}/runtime_output_allocator.bc
++        ${CMAKE_CURRENT_BINARY_DIR}/runtime_tensor_dump.bc
+         ${CMAKE_CURRENT_BINARY_DIR}/runtime_op_state.bc
+         ${CMAKE_CURRENT_BINARY_DIR}/runtime_memory.bc
+         ${CMAKE_CURRENT_BINARY_DIR}/runtime_hip.bc
+@@ -535,6 +538,7 @@ else()
+         ${CMAKE_CURRENT_BINARY_DIR}/runtime_op_profile.bc
+         ${CMAKE_CURRENT_BINARY_DIR}/runtime_chrome_trace.bc
+         ${CMAKE_CURRENT_BINARY_DIR}/runtime_output_allocator.bc
++        ${CMAKE_CURRENT_BINARY_DIR}/runtime_tensor_dump.bc
+         ${CMAKE_CURRENT_BINARY_DIR}/runtime_op_state.bc
+         ${CMAKE_CURRENT_BINARY_DIR}/runtime_op_state_stubs.bc
+         ${CMAKE_CURRENT_BINARY_DIR}/runtime_memory.bc
+diff --git a/lib/Runtime/hipdnn_ep_runtime.h b/lib/Runtime/hipdnn_ep_runtime.h
+index f0bf86386..13fac7a43 100644
+--- a/lib/Runtime/hipdnn_ep_runtime.h
++++ b/lib/Runtime/hipdnn_ep_runtime.h
+@@ -2124,6 +2124,23 @@ int32_t hipdnn_ep_readback_i32(RuntimeState *state, const void *device_scalar);
+ void hipdnn_ep_readback_scalar(RuntimeState *state, void *host_dst,
+                                const void *device_scalar, int64_t num_bytes);
+ 
++// Tensor dump (hip.dump_tensor, docs/design/tensor-dump.md). Writes the
++// logical tensor at `data` (element strides in `strides`) to
++// <HIPDNN_EP_DUMP_DIR>/<sanitized name>.npy and appends a line to
++// <HIPDNN_EP_DUMP_DIR>/index.jsonl. No-op unless HIPDNN_EP_DUMP_DIR is set at
++// run time, `index` is within [HIPDNN_EP_DUMP_START, HIPDNN_EP_DUMP_END], and
++// this is the session's first inference.
++void hipdnn_ep_dump_tensor(RuntimeState *state, const void *data,
++                           const int64_t *shape, const int64_t *strides,
++                           int64_t rank, int64_t elem_bytes, const char *dtype,
++                           const char *name, int64_t index);
++
++// Synchronize the stream, then copy `num_bytes` at `src` (device or
++// host-visible memory) into host `dst`. Returns 0 on success. Backend half of
++// hipdnn_ep_dump_tensor; implemented by the real and mock runtimes.
++int hipdnn_ep_dump_copy_to_host(RuntimeState *state, void *dst, const void *src,
++                                size_t num_bytes);
++
+ // ONNX Size wrapper (dynamic-shape path only).
+ //
+ // Static-shape Size ops are folded into arith.constant at OnnxToHip time
+diff --git a/lib/Runtime/hipdnn_ep_runtime_state.cpp b/lib/Runtime/hipdnn_ep_runtime_state.cpp
+index 0165e3756..3e475f719 100644
+--- a/lib/Runtime/hipdnn_ep_runtime_state.cpp
++++ b/lib/Runtime/hipdnn_ep_runtime_state.cpp
+@@ -569,6 +569,7 @@ static int initialize_state_handles(RuntimeState **out_state) {
+   state->loop_event = nullptr;
+   state->op_states = nullptr;
+   state->num_op_states = 0;
++  state->completed_inferences = 0;
+ 
+   int device_count = 0;
+   if (hipGetDeviceCount(&device_count) != hipSuccess || device_count == 0) {
+diff --git a/lib/Runtime/hipdnn_ep_runtime_tensor.cpp b/lib/Runtime/hipdnn_ep_runtime_tensor.cpp
+index bf0b5cefc..149658bfc 100644
+--- a/lib/Runtime/hipdnn_ep_runtime_tensor.cpp
++++ b/lib/Runtime/hipdnn_ep_runtime_tensor.cpp
+@@ -624,6 +624,7 @@ int hipdnn_ep_stream_sync(RuntimeState *state) {
+     fprintf(stderr, "hipdnn_ep_stream_sync: null state\n");
+     return HIPDNN_EP_ERR_NULL_POINTER;
+   }
++  ++state->completed_inferences;
+ 
+   // PERF: close any window the callbacks above left open, then record D2H end
+   // (after all D2H copies queued). Under the output-allocator ABI the
+diff --git a/lib/Runtime/mock/memory.cpp b/lib/Runtime/mock/memory.cpp
+index f20af7eac..162fb1b27 100644
+--- a/lib/Runtime/mock/memory.cpp
++++ b/lib/Runtime/mock/memory.cpp
+@@ -110,3 +110,12 @@ int wrap_strided_copy(RuntimeState *state, void *dst_ptr, const void *src_ptr,
+   }
+   return 0;
+ }
++
++// Mock "device" memory is host memory: the tensor-dump readback is a memcpy.
++int hipdnn_ep_dump_copy_to_host(RuntimeState *state, void *dst, const void *src,
++                                size_t num_bytes) {
++  if (!state || !dst || !src)
++    return -1;
++  memcpy(dst, src, num_bytes);
++  return 0;
++}
+diff --git a/lib/Runtime/real/memory.cpp b/lib/Runtime/real/memory.cpp
+index 7ee0c0278..72e33eaae 100644
+--- a/lib/Runtime/real/memory.cpp
++++ b/lib/Runtime/real/memory.cpp
+@@ -253,6 +253,29 @@ void hipdnn_ep_readback_scalar(RuntimeState *state, void *host_dst,
+   }
+ }
+ 
++// Tensor-dump readback. Same ordering and hipMemcpyDefault rationale as
++// hipdnn_ep_readback_scalar: the dumped buffer may live in the device pool,
++// host-mapped scratch, or a UMA allocation.
++int hipdnn_ep_dump_copy_to_host(RuntimeState *state, void *dst, const void *src,
++                                size_t num_bytes) {
++  if (!state || !dst || !src)
++    return -1;
++  if (num_bytes == 0)
++    return 0;
++  hipStream_t stream =
++      static_cast<hipStream_t>(hipdnn_ep_state_get_stream(state));
++  hipError_t err =
++      hipMemcpyAsync(dst, src, num_bytes, hipMemcpyDefault, stream);
++  if (err == hipSuccess)
++    err = hipStreamSynchronize(stream);
++  if (err != hipSuccess) {
++    fprintf(stderr, "hipdnn_ep_dump_copy_to_host: %s\n",
++            hipGetErrorString(err));
++    return -1;
++  }
++  return 0;
++}
++
+ int wrap_copy_d2h(RuntimeState *state, void *dst_ptr, const void *src_ptr,
+                   int64_t size_bytes) {
+   OP_PROFILE_CPU_SHAPE(
+diff --git a/lib/Runtime/runtime_state_internal.h b/lib/Runtime/runtime_state_internal.h
+index b2e45a3b5..8d57be27c 100644
+--- a/lib/Runtime/runtime_state_internal.h
++++ b/lib/Runtime/runtime_state_internal.h
+@@ -372,6 +372,12 @@ struct RuntimeState {
+   // constants blob so the weights keep placement priority over it; null when
+   // the session runs without an arena.
+   void *transient_arena;
++
++  // Number of finished inferences, counted by hipdnn_ep_stream_sync, which
++  // generated inference_compute calls exactly once on exit.
++  // hipdnn_ep_runtime_begin_compute cannot count: both the EP and
++  // inference_compute call it. Tensor dump writes only while it is 0.
++  int64_t completed_inferences;
+ };
+ 
+ // Every session-owned device transient (pools, workspace, op scratch) must be
+diff --git a/lib/Runtime/tensor_dump.cpp b/lib/Runtime/tensor_dump.cpp
+new file mode 100644
+index 000000000..ff4cd1de8
+--- /dev/null
++++ b/lib/Runtime/tensor_dump.cpp
+@@ -0,0 +1,286 @@
++/*
++ * Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
++ * Licensed under the MIT License.
++ */
++
++// Host half of hip.dump_tensor (docs/design/tensor-dump.md), shared by the
++// real and mock runtimes; the device-to-host copy is the backend's
++// hipdnn_ep_dump_copy_to_host. Debug-only: every call synchronizes the stream.
++
++#include "debug_log.h"
++#include "hipdnn_ep_runtime.h"
++#include "runtime_state_internal.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <string>
++#include <vector>
++
++namespace {
++
++struct TensorDumpConfig {
++  std::string dir;
++  int64_t start = 0;
++  int64_t end = INT64_MAX;
++};
++
++int64_t envInt(const char *name, int64_t fallback) {
++  const std::string v = hipdnn_ep::env_string(name);
++  if (v.empty())
++    return fallback;
++  char *endp = nullptr;
++  const long long parsed = strtoll(v.c_str(), &endp, 10);
++  return (endp && *endp == '\0') ? static_cast<int64_t>(parsed) : fallback;
++}
++
++// Latched on first use. Read at run time rather than baked in at compile time
++// so a cached artifact that still contains dump ops is silent once the
++// variable is unset.
++const TensorDumpConfig &config() {
++  static const TensorDumpConfig *cfg = [] {
++    auto *c = new TensorDumpConfig;
++    std::string dir = hipdnn_ep::env_string("HIPDNN_EP_DUMP_DIR");
++    if (dir != "0")
++      c->dir = dir;
++    c->start = envInt("HIPDNN_EP_DUMP_START", 0);
++    c->end = envInt("HIPDNN_EP_DUMP_END", INT64_MAX);
++    return c;
++  }();
++  return *cfg;
++}
++
++// ONNX Runtime node-dump file naming: every character that is not an ASCII
++// letter or digit becomes '_' ("/model/layers.0/Add" -> "_model_layers_0_Add").
++std::string fileStem(const char *name) {
++  std::string out;
++  for (const char *p = name; *p; ++p) {
++    const char c = *p;
++    const bool alnum = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
++                       (c >= 'A' && c <= 'Z');
++    out.push_back(alnum ? c : '_');
++  }
++  return out;
++}
++
++// The first session to write a file owns it for the rest of the process, so a
++// later compiled graph with the same tensor names (e.g. the decode
++// specialization after prefill) cannot overwrite the first inference's dump.
++// Repeated writes from the owning session (loop bodies) still overwrite.
++bool claimFile(const RuntimeState *state, const std::string &stem) {
++  static auto *owners = new std::map<std::string, const RuntimeState *>();
++  auto it = owners->find(stem);
++  if (it == owners->end()) {
++    owners->emplace(stem, state);
++    return true;
++  }
++  return it->second == state;
++}
++
++void appendJsonString(std::string &out, const char *s) {
++  out.push_back('"');
++  for (const char *p = s; *p; ++p) {
++    const unsigned char c = static_cast<unsigned char>(*p);
++    if (c == '"' || c == '\\') {
++      out.push_back('\\');
++      out.push_back(static_cast<char>(c));
++    } else if (c < 0x20) {
++      char esc[8];
++      snprintf(esc, sizeof(esc), "\\u%04x", c);
++      out += esc;
++    } else {
++      out.push_back(static_cast<char>(c));
++    }
++  }
++  out.push_back('"');
++}
++
++// One JSON object per line, appended after each tensor so the index is
++// complete up to the last dumped op even if the process crashes. The first
++// append of the process truncates a stale index from an earlier run.
++void appendIndexLine(const std::string &dir, const std::string &line) {
++  static bool truncated = false;
++  const std::string path = dir + "/index.jsonl";
++  FILE *f = fopen(path.c_str(), truncated ? "ab" : "wb");
++  truncated = true;
++  if (!f) {
++    fprintf(stderr, "[TensorDump] cannot open %s\n", path.c_str());
++    return;
++  }
++  fwrite(line.data(), 1, line.size(), f);
++  fclose(f);
++}
++
++// NumPy `descr` for a dump dtype name. bfloat16 and float8 have no NumPy
++// type; they are stored as opaque void elements of the same width so the raw
++// bits survive and nothing reinterprets them as another numeric type.
++const char *npyDescr(const std::string &dtype, int64_t elemBytes) {
++  static const struct {
++    const char *dtype;
++    const char *descr;
++  } kTable[] = {
++      {"float16", "<f2"}, {"float32", "<f4"}, {"float64", "<f8"},
++      {"bool", "|b1"},    {"int8", "|i1"},    {"uint8", "|u1"},
++      {"int16", "<i2"},   {"uint16", "<u2"},  {"int32", "<i4"},
++      {"uint32", "<u4"},  {"int64", "<i8"},   {"uint64", "<u8"},
++  };
++  for (const auto &entry : kTable)
++    if (dtype == entry.dtype)
++      return entry.descr;
++  switch (elemBytes) {
++  case 1:
++    return "|V1";
++  case 2:
++    return "|V2";
++  case 4:
++    return "|V4";
++  default:
++    return "|V8";
++  }
++}
++
++// NPY format version 1.0 header: magic, version, little-endian u16 header
++// length, then a Python dict literal space-padded and '\n'-terminated so the
++// data starts on a 64-byte boundary.
++std::string npyHeader(const char *descr, const int64_t *shape, int64_t rank) {
++  std::string dict = "{'descr': '";
++  dict += descr;
++  dict += "', 'fortran_order': False, 'shape': (";
++  for (int64_t d = 0; d < rank; ++d) {
++    if (d)
++      dict += ", ";
++    dict += std::to_string(shape[d]);
++  }
++  if (rank == 1)
++    dict.push_back(',');
++  dict += "), }";
++  const size_t preamble = 10;
++  const size_t unpadded = preamble + dict.size() + 1;
++  dict.append((64 - unpadded % 64) % 64, ' ');
++  dict.push_back('\n');
++
++  std::string header("\x93NUMPY\x01\x00", 8);
++  const uint16_t len = static_cast<uint16_t>(dict.size());
++  header.push_back(static_cast<char>(len & 0xff));
++  header.push_back(static_cast<char>(len >> 8));
++  header += dict;
++  return header;
++}
++
++bool isRowMajorContiguous(const int64_t *shape, const int64_t *strides,
++                          int64_t rank) {
++  int64_t expected = 1;
++  for (int64_t d = rank - 1; d >= 0; --d) {
++    if (shape[d] != 1 && strides[d] != expected)
++      return false;
++    expected *= shape[d];
++  }
++  return true;
++}
++
++} // namespace
++
++extern "C" void hipdnn_ep_dump_tensor(RuntimeState *state, const void *data,
++                                      const int64_t *shape,
++                                      const int64_t *strides, int64_t rank,
++                                      int64_t elem_bytes, const char *dtype,
++                                      const char *name, int64_t index) {
++  const TensorDumpConfig &cfg = config();
++  if (cfg.dir.empty() || !state || !shape || !strides || !name || !dtype ||
++      rank < 0 || elem_bytes <= 0)
++    return;
++  if (index < cfg.start || index > cfg.end || state->completed_inferences > 0)
++    return;
++  const std::string stem = fileStem(name);
++  if (stem.empty() || !claimFile(state, stem))
++    return;
++
++  int64_t numel = 1;
++  for (int64_t d = 0; d < rank; ++d)
++    numel *= shape[d];
++  if (numel < 0)
++    return;
++
++  // Copy the smallest span that covers every element, then pack it on the
++  // host when the view is strided.
++  const bool contiguous = isRowMajorContiguous(shape, strides, rank);
++  int64_t spanElems = 0;
++  if (numel > 0) {
++    spanElems = contiguous ? numel : 1;
++    if (!contiguous) {
++      for (int64_t d = 0; d < rank; ++d) {
++        if (strides[d] < 0) {
++          fprintf(stderr, "[TensorDump] skip '%s': negative stride\n", name);
++          return;
++        }
++        spanElems += (shape[d] - 1) * strides[d];
++      }
++    }
++  }
++  std::vector<unsigned char> span(static_cast<size_t>(spanElems * elem_bytes));
++  if (!span.empty() &&
++      (!data || hipdnn_ep_dump_copy_to_host(state, span.data(), data,
++                                            span.size()) != 0)) {
++    fprintf(stderr, "[TensorDump] skip '%s': copy to host failed\n", name);
++    return;
++  }
++
++  const unsigned char *payload = span.data();
++  std::vector<unsigned char> packed;
++  if (!contiguous && numel > 0) {
++    packed.resize(static_cast<size_t>(numel * elem_bytes));
++    std::vector<int64_t> pos(static_cast<size_t>(rank), 0);
++    for (int64_t i = 0; i < numel; ++i) {
++      int64_t offset = 0;
++      for (int64_t d = 0; d < rank; ++d)
++        offset += pos[d] * strides[d];
++      memcpy(packed.data() + i * elem_bytes, span.data() + offset * elem_bytes,
++             static_cast<size_t>(elem_bytes));
++      for (int64_t d = rank - 1; d >= 0; --d) {
++        if (++pos[d] < shape[d])
++          break;
++        pos[d] = 0;
++      }
++    }
++    payload = packed.data();
++  }
++
++  const std::string file = stem + ".npy";
++  const std::string path = cfg.dir + "/" + file;
++  FILE *f = fopen(path.c_str(), "wb");
++  if (!f) {
++    fprintf(stderr, "[TensorDump] cannot open %s\n", path.c_str());
++    return;
++  }
++  const std::string header =
++      npyHeader(npyDescr(dtype, elem_bytes), shape, rank);
++  const size_t bytes = static_cast<size_t>(numel * elem_bytes);
++  const bool ok = fwrite(header.data(), 1, header.size(), f) == header.size() &&
++                  (bytes == 0 || fwrite(payload, 1, bytes, f) == bytes);
++  fclose(f);
++  if (!ok) {
++    fprintf(stderr, "[TensorDump] short write to %s\n", path.c_str());
++    return;
++  }
++
++  std::string line = "{\"index\":" + std::to_string(index) + ",\"name\":";
++  appendJsonString(line, name);
++  line += ",\"file\":";
++  appendJsonString(line, file.c_str());
++  line += ",\"dtype\":";
++  appendJsonString(line, dtype);
++  line += ",\"shape\":[";
++  for (int64_t d = 0; d < rank; ++d) {
++    if (d)
++      line.push_back(',');
++    line += std::to_string(shape[d]);
++  }
++  line += "]}\n";
++  appendIndexLine(cfg.dir, line);
++
++  RUNTIME_DEBUG_LOG("[TensorDump] #%lld %s -> %s (%lld elements, %s)\n",
++                    (long long)index, name, path.c_str(), (long long)numel,
++                    dtype);
++}
+diff --git a/test/runtime/CMakeLists.txt b/test/runtime/CMakeLists.txt
+index a7a382372..36e671108 100644
+--- a/test/runtime/CMakeLists.txt
++++ b/test/runtime/CMakeLists.txt
+@@ -37,6 +37,22 @@ add_test(NAME OutputAllocatorUnitTest COMMAND test-output-allocator)
+ 
+ set_target_properties(test-output-allocator PROPERTIES FOLDER "runtime-tests")
+ 
++# hip.dump_tensor host side (tensor_dump.cpp, also runtime bitcode) against the
++# mock runtime types; the test supplies the device-to-host copy.
++add_executable(test-tensor-dump
++    test_tensor_dump.cpp
++    ${CMAKE_SOURCE_DIR}/lib/Runtime/tensor_dump.cpp
++)
++target_compile_features(test-tensor-dump PRIVATE cxx_std_17)
++target_include_directories(test-tensor-dump PRIVATE
++    ${CMAKE_SOURCE_DIR}/include
++    ${CMAKE_SOURCE_DIR}/lib/Runtime
++    ${CMAKE_SOURCE_DIR}/lib/Runtime/mock
++)
++target_compile_definitions(test-tensor-dump PRIVATE HIPDNN_EP_RT_NO_EXPORT)
++add_test(NAME TensorDumpUnitTest COMMAND test-tensor-dump)
++set_target_properties(test-tensor-dump PROPERTIES FOLDER "runtime-tests")
++
+ # Header-only offset allocator behind the session transient arena.
+ add_executable(test-transient-arena test_transient_arena.cpp)
+ target_compile_features(test-transient-arena PRIVATE cxx_std_17)
+diff --git a/test/runtime/test_tensor_dump.cpp b/test/runtime/test_tensor_dump.cpp
+new file mode 100644
+index 000000000..c33719e85
+--- /dev/null
++++ b/test/runtime/test_tensor_dump.cpp
+@@ -0,0 +1,192 @@
++/*
++ * Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
++ * Licensed under the MIT License.
++ */
++
++//===----------------------------------------------------------------------===//
++// GPU-free unit test for the hip.dump_tensor runtime contract.
++//
++// Compiles lib/Runtime/tensor_dump.cpp natively against the MOCK runtime types
++// and supplies hipdnn_ep_dump_copy_to_host as a memcpy, then checks:
++//   * ONNX Runtime file naming and the NPY v1.0 header / payload
++//   * strided views are packed to their logical row-major layout
++//   * index.jsonl records name / file / dtype / shape
++//   * the HIPDNN_EP_DUMP_START/END filter, the first-inference gate and the
++//     per-file session ownership
++//===----------------------------------------------------------------------===//
++
++#include "hipdnn_ep_runtime.h"
++#include "runtime_state_internal.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <iterator>
++#include <string>
++#include <vector>
++
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <stdlib.h>
++#endif
++
++extern "C" int hipdnn_ep_dump_copy_to_host(RuntimeState *state, void *dst,
++                                           const void *src, size_t num_bytes) {
++  if (!state || !dst || !src)
++    return -1;
++  std::memcpy(dst, src, num_bytes);
++  return 0;
++}
++
++namespace {
++
++int g_failures = 0;
++
++#define CHECK(cond)                                                            \
++  do {                                                                         \
++    if (!(cond)) {                                                             \
++      std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);     \
++      ++g_failures;                                                            \
++    }                                                                          \
++  } while (0)
++
++void setEnv(const char *name, const char *value) {
++#ifdef _WIN32
++  SetEnvironmentVariableA(name, value);
++#else
++  setenv(name, value, 1);
++#endif
++}
++
++std::string readFile(const std::filesystem::path &path) {
++  std::ifstream in(path, std::ios::binary);
++  return std::string(std::istreambuf_iterator<char>(in),
++                     std::istreambuf_iterator<char>());
++}
++
++struct Npy {
++  std::string dict; // header dict, padding included
++  std::string data;
++};
++
++// Splits an NPY v1.0 file; `dict` is empty when the preamble is malformed or
++// the data does not start on a 64-byte boundary.
++Npy readNpy(const std::filesystem::path &p) {
++  const std::string bytes = readFile(p);
++  if (bytes.size() < 10 || bytes.compare(0, 8, "\x93NUMPY\x01\x00", 8) != 0)
++    return {};
++  const size_t len = static_cast<unsigned char>(bytes[8]) |
++                     (static_cast<unsigned char>(bytes[9]) << 8);
++  if (bytes.size() < 10 + len || (10 + len) % 64 != 0)
++    return {};
++  return {bytes.substr(10, len), bytes.substr(10 + len)};
++}
++
++template <typename T> std::vector<T> npyData(const std::filesystem::path &p) {
++  const std::string data = readNpy(p).data;
++  std::vector<T> out(data.size() / sizeof(T));
++  std::memcpy(out.data(), data.data(), out.size() * sizeof(T));
++  return out;
++}
++
++bool npyHas(const std::filesystem::path &p, const char *text) {
++  return readNpy(p).dict.find(text) != std::string::npos;
++}
++
++void dump(RuntimeState &st, const void *data, std::vector<int64_t> shape,
++          std::vector<int64_t> strides, int64_t elemBytes, const char *dtype,
++          const char *name, int64_t index) {
++  hipdnn_ep_dump_tensor(&st, data, shape.data(), strides.data(),
++                        static_cast<int64_t>(shape.size()), elemBytes, dtype,
++                        name, index);
++}
++
++} // namespace
++
++int main() {
++  namespace fs = std::filesystem;
++  const fs::path dir = fs::temp_directory_path() / "hipdnn_ep_tensor_dump_test";
++  fs::remove_all(dir);
++  fs::create_directories(dir);
++  setEnv("HIPDNN_EP_DUMP_DIR", dir.string().c_str());
++  setEnv("HIPDNN_EP_DUMP_START", "0");
++  setEnv("HIPDNN_EP_DUMP_END", "10");
++
++  RuntimeState st{};
++  st.completed_inferences = 0;
++
++  // Contiguous 2x3 fp16-sized payload; name uses ORT sanitization.
++  const uint16_t half[6] = {1, 2, 3, 4, 5, 6};
++  dump(st, half, {2, 3}, {3, 1}, 2, "float16", "/model/layers.0/Add:0", 0);
++  const fs::path addFile = dir / "_model_layers_0_Add_0.npy";
++  CHECK(fs::exists(addFile));
++  CHECK(npyHas(addFile, "'descr': '<f2'"));
++  CHECK(npyHas(addFile, "'fortran_order': False"));
++  CHECK(npyHas(addFile, "'shape': (2, 3)"));
++  CHECK(npyData<uint16_t>(addFile) ==
++        std::vector<uint16_t>(std::begin(half), std::end(half)));
++
++  // Strided view: columns 1..2 of a 3x4 int32 buffer.
++  const int32_t base[12] = {0, 1, 2, 3, 10, 11, 12, 13, 20, 21, 22, 23};
++  dump(st, base + 1, {3, 2}, {4, 1}, 4, "int32", "slice", 1);
++  CHECK(npyHas(dir / "slice.npy", "'descr': '<i4'"));
++  CHECK(npyData<int32_t>(dir / "slice.npy") ==
++        (std::vector<int32_t>{1, 2, 11, 12, 21, 22}));
++
++  // Rank-0 scalar and the rank-1 tuple spelling.
++  const int64_t scalar = 42;
++  dump(st, &scalar, {}, {}, 8, "int64", "scalar", 2);
++  CHECK(npyHas(dir / "scalar.npy", "'shape': ()"));
++  CHECK(npyData<int64_t>(dir / "scalar.npy") == std::vector<int64_t>{42});
++  dump(st, half, {6}, {1}, 2, "bfloat16", "vector", 4);
++  CHECK(npyHas(dir / "vector.npy", "'descr': '|V2'"));
++  CHECK(npyHas(dir / "vector.npy", "'shape': (6,)"));
++
++  // Outside [START, END]: not written.
++  dump(st, half, {6}, {1}, 2, "float16", "filtered", 11);
++  CHECK(!fs::exists(dir / "filtered.npy"));
++
++  // A second session cannot overwrite a file owned by the first one.
++  RuntimeState other{};
++  other.completed_inferences = 0;
++  const uint16_t zeros[6] = {};
++  dump(other, zeros, {2, 3}, {3, 1}, 2, "float16", "/model/layers.0/Add:0", 0);
++  CHECK(npyData<uint16_t>(addFile) ==
++        std::vector<uint16_t>(std::begin(half), std::end(half)));
++
++  // The owning session overwrites during its first inference (loop bodies)...
++  const uint16_t sevens[6] = {7, 7, 7, 7, 7, 7};
++  dump(st, sevens, {2, 3}, {3, 1}, 2, "float16", "/model/layers.0/Add:0", 0);
++  CHECK(npyData<uint16_t>(addFile) ==
++        std::vector<uint16_t>(std::begin(sevens), std::end(sevens)));
++
++  // ...but not from its second inference on.
++  st.completed_inferences = 1;
++  dump(st, half, {2, 3}, {3, 1}, 2, "float16", "/model/layers.0/Add:0", 0);
++  dump(st, half, {6}, {1}, 2, "float16", "late", 3);
++  CHECK(npyData<uint16_t>(addFile) ==
++        std::vector<uint16_t>(std::begin(sevens), std::end(sevens)));
++  CHECK(!fs::exists(dir / "late.npy"));
++
++  const std::string index = readFile(dir / "index.jsonl");
++  CHECK(index.find("{\"index\":0,\"name\":\"/model/layers.0/Add:0\","
++                   "\"file\":\"_model_layers_0_Add_0.npy\","
++                   "\"dtype\":\"float16\",\"shape\":[2,3]}\n") == 0);
++  CHECK(index.find("\"file\":\"slice.npy\",\"dtype\":\"int32\","
++                   "\"shape\":[3,2]}") != std::string::npos);
++  CHECK(index.find("\"file\":\"scalar.npy\",\"dtype\":\"int64\","
++                   "\"shape\":[]}") != std::string::npos);
++  CHECK(index.find("filtered") == std::string::npos);
++  CHECK(index.find("late") == std::string::npos);
++
++  fs::remove_all(dir);
++  if (g_failures) {
++    std::fprintf(stderr, "%d check(s) failed\n", g_failures);
++    return 1;
++  }
++  std::printf("TensorDumpUnitTest: all checks passed\n");
++  return 0;
++}
+-- 
+2.56.0.windows.4
+
