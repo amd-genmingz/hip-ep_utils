@@ -80,11 +80,45 @@ export HIPDNN_EP_DUMP_END=6666
 
 ## 5. 对比
 
-TODO: 按 `index.jsonl` 的顺序逐个与 CPU 文件对比，报告第一个超出阈值的 tensor。
+通过 `helper/main.py` 的 `accuracy` 子命令调用 `helper/accuracy_dirs.py`，把 CPU dump 与 GPU dump 按 ONNX 拓扑顺序对比，并写出 CSV。该子命令固定传入 `--order topo`。
+
+在 `accuracy_issue_locate` 目录下：
+
+```bash
+python helper/main.py accuracy \
+    --model model.onnx \
+    --ref  dump \
+    --test dump_gpu \
+    --csv  report.csv
+```
+
+`--ref` 是 CPU 参考目录，里面应是 `.npy` 或 `.bin`（第 2 节得到的是 `.tensorproto`，需先转换）。`--test` 是第 4 节的 GPU 目录。`--model` 提供拓扑顺序：图输入在前，其后按 `graph.node` 排列，同一节点的多个输出共用该节点的序号。不提供可用的模型时，脚本会改按 `l2` 排序，得到的 CSV 不能用来找第一个错误节点。
+
+`main.py accuracy` 比较进程的工作目录是 `helper/`，传入的相对路径按 `helper/` 解析。省略 `--ref`、`--test`、`--csv` 时，默认比较 `helper/dump_cpuep` 和 `helper/dump_hipep`，CSV 写到 `helper/report.csv`。
+
+脚本按文件名配对，并自动处理 `InsertedPrecisionFreeCast_` 前缀和多输出算子的 `_out{N}` 后缀。CSV 与终端表格使用去掉这些前后缀后的逻辑 tensor 名，行顺序即拓扑顺序（`idx` 从 0 开始，`topo_idx` 递增）。
+
+从上往下读 CSV。误差会传到下游，所以主指标第一次变差的那一行是根因，它的 `op_type` 就是要修的节点；修完后重新 dump，再跑一次对比。
+
+| 列 | 含义 |
+|---|---|
+| `topo_idx` | 拓扑序号，越小越靠前 |
+| `op_type` | 产生该 tensor 的算子；图输入为 `<input>` |
+| `orig_name` | ONNX tensor 名 |
+| `l2` | `ref - test` 的 L2 范数 |
+| `cos` | 两侧向量的余弦相似度，同方向为 1 |
+| `status` | `EXACT` / `PASS` / `WARN` / `FAIL` / `NAN/INF` |
+
+`a_*` 是 ref（CPU），`b_*` 是 test（GPU）。`status` 按 `rel_l2` 和 `max_abs` 分档：`l2 == 0` 为 `EXACT`，`rel_l2 < 1e-3` 或 `max_abs < 1e-3` 为 `PASS`，`rel_l2 < 1e-2` 为 `WARN`，否则为 `FAIL`；任一侧含 NaN 或 Inf 为 `NAN/INF`。`NAN/INF` 与模型类型无关，该行即出错。其余行按模型看主指标：
+
+- **CNN**：主要看 `l2`。对齐的行 `l2` 为 0 或处于数值噪声；从上往下，`l2` 第一次明显变大的行就是第一个错误节点。
+- **LLM**：主要看 `cos`。激活元素很多，`l2` 会随元素个数变大；`cos` 衡量方向是否一致。健康行的 `cos` 非常接近 1；从上往下，`cos` 第一次明显下降的行就是第一个错误节点。
 
 ## 6. 定位到第一个错误节点后
 
-TODO
+每个算子的 GPU 结果与 CPU 参考都允许存在数值差。只有准确度出现较大偏差时，才断言某一层算子异常。偏差是否足够大，由 AI 综合判断：模型类型（CNN 看 `l2`，LLM 看 `cos`）、该行相对上游健康行的变化，以及误差是否从这一行开始向下游传递。
+
+判定之后，在对话中指出异常层（`topo_idx`、`op_type`、`orig_name`），并说明原因。同时询问是否需要结合代码继续分析，由用户决定后再进行。
 
 ## 7. 限制
 
